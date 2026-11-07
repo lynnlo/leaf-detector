@@ -1,120 +1,452 @@
+"""Detect leaves from the Raspberry Pi camera and steer two motors toward them.
+
+Each step captures a frame, runs the leaf detector, picks the nearest detection,
+converts the box's horizontal offset into differential motor speeds, holds that
+command briefly, stops, and repeats. Motor output goes through the L298N class in
+drive.py, so the pinout lives in one place.
+
+Motors only move when --drive is passed. Without it the script prints the command
+it would send and leaves the wheels still.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
 import subprocess
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import BinaryIO
+import sys
+import time
+from contextlib import ExitStack
+from dataclasses import dataclass
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+from drive import L298N
 
 
-def read_jpeg_frame(stream: BinaryIO, buffer: bytearray) -> bytes | None:
-    start_marker = b"\xff\xd8"
-    end_marker = b"\xff\xd9"
-
-    while True:
-        start = buffer.find(start_marker)
-        if start == -1:
-            chunk = stream.read(4096)
-            if not chunk:
-                return None
-            buffer.extend(chunk)
-            start = buffer.find(start_marker)
-            if start == -1:
-                # Keep a possible first byte of a JPEG marker split across reads.
-                keep = 1 if buffer[-1:] == b"\xff" else 0
-                if keep:
-                    buffer[:] = buffer[-1:]
-                else:
-                    buffer.clear()
-                continue
-
-        if start:
-            del buffer[:start]
-
-        end = buffer.find(end_marker, len(start_marker))
-        if end != -1:
-            frame_end = end + len(end_marker)
-            frame = bytes(buffer[:frame_end])
-            del buffer[:frame_end]
-            return frame
-
-        chunk = stream.read(4096)
-        if not chunk:
-            return None
-        buffer.extend(chunk)
+# Class names requested from a zero-shot model when no trained model is supplied.
+DEFAULT_CLASSES = ("leaf", "fallen leaf", "pile of leaves")
+ZERO_SHOT_MODEL = "yolov8s-worldv2.pt"
 
 
-class VideoHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
-        if self.path != "/":
-            self.send_error(404)
+@dataclass(frozen=True)
+class Detection:
+    """One detected leaf, in pixel coordinates."""
+
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    confidence: float
+    label: str
+
+    @property
+    def width(self) -> float:
+        return max(0.0, self.x2 - self.x1)
+
+    @property
+    def height(self) -> float:
+        return max(0.0, self.y2 - self.y1)
+
+    @property
+    def area(self) -> float:
+        return self.width * self.height
+
+    @property
+    def center_x(self) -> float:
+        return (self.x1 + self.x2) / 2.0
+
+    @property
+    def center_y(self) -> float:
+        return (self.y1 + self.y2) / 2.0
+
+
+@dataclass(frozen=True)
+class DriveParams:
+    """Tuning for turning a detection box into wheel speeds."""
+
+    k_angle: float = 1.2
+    k_linear: float = 0.9
+    v_max: float = 0.6
+    center_tolerance: float = 0.08
+    stop_height_ratio: float = 0.6
+
+
+class Camera:
+    """Source of BGR frames, preferring picamera2 and falling back to rpicam-still."""
+
+    def __init__(self, width: int, height: int) -> None:
+        self.width = width
+        self.height = height
+        self._picam = None
+        self.backend = "rpicam-still"
+
+        try:
+            from picamera2 import Picamera2
+        except ImportError:
             return
 
-        self.send_response(200)
-        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
+        picam = Picamera2()
+        config = picam.create_video_configuration(
+            main={"size": (width, height), "format": "BGR888"}
+        )
+        picam.configure(config)
+        picam.start()
+        time.sleep(0.5)  # Let auto-exposure settle before the first frame.
+        self._picam = picam
+        self.backend = "picamera2"
 
-        camera = self.server.camera
-        buffer = self.server.jpeg_buffer
-        while True:
-            frame = read_jpeg_frame(camera.stdout, buffer)
-            if frame is None:
-                return
-            try:
-                self.wfile.write(
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n"
-                    + f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii")
-                    + frame
-                    + b"\r\n"
+    def read(self) -> np.ndarray:
+        if self._picam is not None:
+            return self._picam.capture_array()
+
+        result = subprocess.run(
+            [
+                "rpicam-still",
+                "--nopreview",
+                "--encoding",
+                "jpg",
+                "--width",
+                str(self.width),
+                "--height",
+                str(self.height),
+                "--timeout",
+                "200",
+                "--output",
+                "-",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        frame = cv2.imdecode(np.frombuffer(result.stdout, np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            raise RuntimeError("rpicam-still produced no decodable frame")
+        return frame
+
+    def close(self) -> None:
+        if self._picam is not None:
+            self._picam.stop()
+            self._picam.close()
+            self._picam = None
+
+
+class LeafDetector:
+    """Wraps an Ultralytics model and returns Detection objects."""
+
+    def __init__(
+        self,
+        model_path: str,
+        confidence: float,
+        imgsz: int,
+        classes: tuple[str, ...] = DEFAULT_CLASSES,
+    ) -> None:
+        from ultralytics import YOLO
+
+        self.model = YOLO(model_path)
+        self.confidence = confidence
+        self.imgsz = imgsz
+
+        # Zero-shot models need their vocabulary set before inference.
+        if "world" in Path(model_path).stem.lower():
+            self.model.set_classes(list(classes))
+
+    def detect(self, frame: np.ndarray) -> list[Detection]:
+        result = self.model.predict(
+            frame, imgsz=self.imgsz, conf=self.confidence, verbose=False
+        )[0]
+        boxes = result.boxes
+        if boxes is None:
+            return []
+
+        names = result.names
+        detections: list[Detection] = []
+        for xyxy, conf, cls in zip(
+            boxes.xyxy.tolist(), boxes.conf.tolist(), boxes.cls.tolist()
+        ):
+            detections.append(
+                Detection(
+                    x1=float(xyxy[0]),
+                    y1=float(xyxy[1]),
+                    x2=float(xyxy[2]),
+                    y2=float(xyxy[3]),
+                    confidence=float(conf),
+                    label=str(names[int(cls)]),
                 )
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                return
+            )
+        return detections
 
 
-class VideoHTTPServer(HTTPServer):
-    def __init__(self, camera: subprocess.Popen[bytes]) -> None:
-        self.camera = camera
-        self.jpeg_buffer = bytearray()
-        super().__init__(("0.0.0.0", 8000), VideoHandler)
+def choose_target(detections: list[Detection]) -> Detection | None:
+    """Return the nearest detection.
+
+    On a downward-tilted camera a box whose bottom edge sits lower in the image
+    is closer to the robot, so the lowest bottom edge wins. Box area breaks ties.
+    """
+    if not detections:
+        return None
+    return max(detections, key=lambda d: (d.y2, d.area))
 
 
-def main() -> None:
-    camera = subprocess.Popen(
-        [
-            "rpicam-vid",
-            "--nopreview",
-            "--timeout",
-            "0",
-            "--codec",
-            "mjpeg",
-            "--width",
-            "640",
-            "--height",
-            "480",
-            "--framerate",
-            "20",
-            "--output",
-            "-",
-        ],
-        stdout=subprocess.PIPE,
+def compute_command(
+    detection: Detection | None,
+    frame_width: int,
+    frame_height: int,
+    params: DriveParams,
+) -> tuple[float, float, str]:
+    """Turn a detection box into (left, right, reason) wheel speeds in -1..1.
+
+    A positive horizontal offset means the target sits right of centre; the left
+    wheel is then driven faster than the right, which rotates the chassis toward
+    the target. Forward speed falls off as the target moves off-centre so the
+    robot turns before it drives.
+    """
+    if detection is None:
+        return 0.0, 0.0, "no leaf in view"
+
+    closeness = detection.height / max(1.0, float(frame_height))
+    if closeness >= params.stop_height_ratio:
+        return 0.0, 0.0, f"arrived (box fills {closeness:.0%} of frame height)"
+
+    half_width = max(1.0, frame_width / 2.0)
+    offset = (detection.center_x - frame_width / 2.0) / half_width
+    offset = max(-1.0, min(1.0, offset))
+
+    turn = params.k_angle * offset
+    forward = params.v_max * (1.0 - min(abs(offset), 1.0))
+
+    if abs(offset) <= params.center_tolerance:
+        direction = "straight"
+    elif offset > 0:
+        direction = "right"
+    else:
+        direction = "left"
+
+    left = max(-1.0, min(1.0, forward + turn))
+    right = max(-1.0, min(1.0, forward - turn))
+    reason = (
+        f"{direction} offset={offset:+.2f} "
+        f"closeness={closeness:.0%} conf={detection.confidence:.2f}"
     )
-    if camera.stdout is None:
-        camera.terminate()
-        raise RuntimeError("Could not open rpicam-vid output")
+    return left, right, reason
+
+
+def annotate(
+    frame: np.ndarray,
+    detections: list[Detection],
+    target: Detection | None,
+    note: str,
+) -> np.ndarray:
+    """Draw every detection, highlighting the chosen target, plus a status line."""
+    canvas = frame.copy()
+    height, width = canvas.shape[:2]
+
+    for det in detections:
+        chosen = det is target
+        colour = (0, 255, 0) if chosen else (0, 165, 255)
+        thickness = 3 if chosen else 1
+        cv2.rectangle(
+            canvas,
+            (int(det.x1), int(det.y1)),
+            (int(det.x2), int(det.y2)),
+            colour,
+            thickness,
+        )
+        cv2.putText(
+            canvas,
+            f"{det.label} {det.confidence:.2f}",
+            (int(det.x1), max(12, int(det.y1) - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            colour,
+            1,
+            cv2.LINE_AA,
+        )
+
+    cv2.line(
+        canvas,
+        (width // 2, height - 40),
+        (width // 2, height),
+        (255, 255, 255),
+        1,
+    )
+    cv2.putText(
+        canvas,
+        f"leaves={len(detections)} {note}",
+        (8, 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    return canvas
+
+
+def resolve_model(explicit: str | None) -> str:
+    """Pick the model path: an explicit one, a local trained one, else zero-shot."""
+    if explicit:
+        return explicit
+    local = Path(__file__).with_name("models") / "leaf.pt"
+    if local.exists():
+        return str(local)
+    print(
+        f"No trained model found at {local}; falling back to zero-shot "
+        f"{ZERO_SHOT_MODEL}. Accuracy will be poor until a model is trained and "
+        "placed there, or passed with --model.",
+        file=sys.stderr,
+    )
+    return ZERO_SHOT_MODEL
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Detect leaves from the Pi camera and steer toward them."
+    )
+    parser.add_argument("--model", help="path to a trained YOLO weights file")
+    parser.add_argument(
+        "--conf", type=float, default=0.35, help="detection confidence (default: 0.35)"
+    )
+    parser.add_argument(
+        "--imgsz", type=int, default=320, help="inference size (default: 320)"
+    )
+    parser.add_argument(
+        "--width", type=int, default=640, help="capture width (default: 640)"
+    )
+    parser.add_argument(
+        "--height", type=int, default=480, help="capture height (default: 480)"
+    )
+    parser.add_argument(
+        "--steps", type=int, default=10, help="detect-and-drive cycles (default: 10)"
+    )
+    parser.add_argument(
+        "--hold",
+        type=float,
+        default=0.4,
+        help="seconds per drive command (default: 0.4)",
+    )
+    parser.add_argument(
+        "--speed",
+        type=int,
+        default=45,
+        metavar="PERCENT",
+        help="cap on wheel speed, 1-100 (default: 45)",
+    )
+    parser.add_argument(
+        "--k-angle", type=float, default=DriveParams.k_angle, help="turn gain"
+    )
+    parser.add_argument(
+        "--k-linear", type=float, default=DriveParams.k_linear, help="forward gain"
+    )
+    parser.add_argument(
+        "--stop-height",
+        type=float,
+        default=DriveParams.stop_height_ratio,
+        help="stop once the box fills this fraction of frame height (default: 0.6)",
+    )
+    parser.add_argument(
+        "--drive",
+        action="store_true",
+        help="energise the motors; without this the command is only printed",
+    )
+    parser.add_argument(
+        "--search",
+        action="store_true",
+        help="rotate in place when no leaf is visible instead of stopping",
+    )
+    parser.add_argument(
+        "--preview", action="store_true", help="show an annotated window"
+    )
+    parser.add_argument("--save", metavar="PATH", help="write the annotated last frame")
+    args = parser.parse_args(argv)
+
+    if not 1 <= args.speed <= 100:
+        parser.error("--speed must be between 1 and 100")
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    speed_cap = args.speed / 100.0
+    params = DriveParams(
+        k_angle=args.k_angle,
+        k_linear=args.k_linear,
+        v_max=speed_cap,
+        stop_height_ratio=args.stop_height,
+    )
+
+    model_path = resolve_model(args.model)
+    if not os.path.exists(model_path) and model_path != ZERO_SHOT_MODEL:
+        print(f"Model not found: {model_path}", file=sys.stderr)
+        return 1
+
+    camera = Camera(args.width, args.height)
+    print(f"camera backend: {camera.backend}")
 
     try:
-        server = VideoHTTPServer(camera)
-        print("Streaming camera video at http://<raspberry-pi-ip>:8000/")
-        with server:
-            server.serve_forever()
-    finally:
-        if camera.poll() is None:
-            camera.terminate()
-            try:
-                camera.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                camera.kill()
-                camera.wait()
+        detector = LeafDetector(model_path, args.conf, args.imgsz)
+    except ImportError:
+        camera.close()
+        print("ultralytics is not installed. Run: pip install ultralytics", file=sys.stderr)
+        return 1
+
+    with ExitStack() as stack:
+        driver = L298N(stack) if args.drive else None
+        if driver is None:
+            print("dry run: motors are not energised (pass --drive to move)")
+
+        search_speed = speed_cap * 0.4
+        last_frame: np.ndarray | None = None
+
+        try:
+            for step in range(args.steps):
+                frame = camera.read()
+                detections = detector.detect(frame)
+                target = choose_target(detections)
+                left, right, note = compute_command(
+                    target, frame.shape[1], frame.shape[0], params
+                )
+
+                if target is None and args.search:
+                    left, right = -search_speed, search_speed
+                    note = "searching: rotating in place"
+
+                print(
+                    f"[{step + 1}/{args.steps}] {note} "
+                    f"left={left:+.2f} right={right:+.2f}"
+                )
+
+                last_frame = annotate(frame, detections, target, note)
+                if args.preview:
+                    cv2.imshow("leaf-dec", last_frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+
+                if driver is not None and (left or right):
+                    driver.drive(left, right)
+                    time.sleep(args.hold)
+                    driver.stop()
+
+                if target is not None and left == 0.0 and right == 0.0:
+                    print("target reached")
+                    break
+
+        except KeyboardInterrupt:
+            print("\nInterrupted.")
+        finally:
+            if driver is not None:
+                driver.stop()
+            camera.close()
+            if args.preview:
+                cv2.destroyAllWindows()
+            if args.save and last_frame is not None:
+                cv2.imwrite(args.save, last_frame)
+                print(f"saved {args.save}")
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
