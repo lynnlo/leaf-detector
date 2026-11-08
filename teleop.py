@@ -145,8 +145,6 @@ class Teleop:
 def build_page() -> str:
     body = """
 <div class="layout">
-  <div class="feed"><img src="/stream" alt="camera feed"></div>
-
   <div class="controls">
     <div class="col">
       <div class="joy">
@@ -162,6 +160,9 @@ def build_page() -> str:
         <span class="stat" id="link">connecting</span>
       </div>
     </div>
+    
+    <div class="feed"><img src="/stream" alt="camera feed"></div>
+  
 
     <div class="col right">
       <div class="dpad">
@@ -171,7 +172,7 @@ def build_page() -> str:
         <button class="pad down" data-dir="y-">&#9660;</button>
       </div>
       <button class="stop" id="stop">STOP</button>
-      <button id="brush">brushes off</button>
+      <button class="brush" id="brush">brushes off</button>
       <label class="slider-label">speed <input id="speed" type="range" min="10" max="100" value="60"></label>
     </div>
   </div>
@@ -206,6 +207,8 @@ def build_page() -> str:
   .pad:active, .pad.on { background: #2d6cdf; border-color: #2d6cdf; }
   .stop { width: 110px; height: 42px; background: #4a1f24; border-color: #7a3038;
           font-weight: 700; letter-spacing: .04em; }
+  .stop { width: 110px; height: 42px; background: #241f4a; border-color: #38307a;
+            font-weight: 700; letter-spacing: .04em; }
   .slider-label { display: flex; align-items: center; gap: 8px;
                   color: #8a94a0; font-size: 12px; text-transform: uppercase;
                   letter-spacing: .06em; }
