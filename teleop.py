@@ -148,60 +148,68 @@ def build_page() -> str:
   <div class="feed"><img src="/stream" alt="camera feed"></div>
 
   <div class="controls">
-    <div class="bar">
-      <span class="stat">L <b id="left">0.00</b></span>
-      <span class="stat">R <b id="right">0.00</b></span>
-      <span class="stat">speed <b id="spd">60</b>%</span>
-    </div>
-    <div class="bar">
-      <span class="stat" id="mode" style="color:#ffcc66"></span>
-      <span class="stat" id="link" style="color:#8fb6ff">connecting</span>
+    <div class="col">
+      <div class="joy">
+        <div id="stick" class="stick"><div id="knob" class="knob"></div></div>
+      </div>
+      <div class="stats">
+        <span class="stat">L <b id="left">0.00</b></span>
+        <span class="stat">R <b id="right">0.00</b></span>
+        <span class="stat">speed <b id="spd">60</b>%</span>
+      </div>
+      <div class="stats">
+        <span class="stat" id="mode"></span>
+        <span class="stat" id="link">connecting</span>
+      </div>
     </div>
 
-    <div class="dpad">
-      <button class="pad up" data-dir="y+">&#9650;</button>
-      <button class="pad left" data-dir="x-">&#9664;</button>
-      <button class="pad right" data-dir="x+">&#9654;</button>
-      <button class="pad down" data-dir="y-">&#9660;</button>
+    <div class="col right">
+      <div class="dpad">
+        <button class="pad up" data-dir="y+">&#9650;</button>
+        <button class="pad left" data-dir="x-">&#9664;</button>
+        <button class="pad right" data-dir="x+">&#9654;</button>
+        <button class="pad down" data-dir="y-">&#9660;</button>
+      </div>
+      <button class="stop" id="stop">STOP</button>
+      <button id="brush">brushes off</button>
+      <label class="slider-label">speed <input id="speed" type="range" min="10" max="100" value="60"></label>
     </div>
-    <button class="pad stop" id="stop">STOP</button>
-
-    <div id="stick" class="stick"><div id="knob" class="knob"></div></div>
-
-    <label class="stat">speed <input id="speed" type="range" min="10" max="100" value="60"></label>
-    <button id="brush">brushes off</button>
   </div>
 </div>
 
 <style>
-  .layout { display: flex; gap: 14px; align-items: flex-start; justify-content: center;
+  .layout { display: flex; gap: 16px; align-items: flex-start; justify-content: center;
             flex-wrap: wrap; width: 100%; max-width: 1080px; }
   .feed { flex: 1 1 460px; min-width: 300px; }
   .feed img { max-height: 56vh; width: 100%; object-fit: contain; }
-  .controls { flex: 0 0 auto; display: flex; flex-direction: column; gap: 9px;
-              align-items: center; }
+  .controls { display: flex; gap: 16px; flex: 1 1 480px; min-width: 360px;
+              align-items: flex-start; }
+  .col { display: flex; flex-direction: column; gap: 12px; align-items: center; }
+  .col.right { align-items: center; }
 
-  .dpad { display: grid; grid-template-columns: repeat(3, 62px); gap: 6px;
-          justify-content: center; }
-  .up { grid-area: 1 / 2; } .left { grid-area: 2 / 1; }
-  .right { grid-area: 2 / 3; } .down { grid-area: 3 / 2; }
+  .stick { position: relative; width: 160px; height: 160px; border-radius: 50%;
+           background: radial-gradient(circle at 50% 50%, #1b232c 0%, #141a21 70%);
+           border: 1px solid #2a3947; touch-action: none; user-select: none; }
+  .knob { position: absolute; width: 56px; height: 56px; border-radius: 50%;
+          background: #2d6cdf; left: 52px; top: 52px; pointer-events: none;
+          box-shadow: 0 0 18px rgba(45,108,223,.55); }
 
-  .pad { width: 62px; height: 50px; font-size: 17px; border-radius: 10px;
+  .stats { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+  .stat { color: #8a94a0; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+  .stat b { color: #e6e9ee; font-size: 18px; font-weight: 600; }
+
+  .dpad { display: grid; grid-template-columns: 60px 60px; grid-template-rows: 60px 60px;
+          gap: 6px; }
+  .pad { width: 60px; height: 60px; font-size: 18px; border-radius: 12px;
          border: 1px solid #2a3947; background: #1b232c; color: #e6e9ee;
          cursor: pointer; touch-action: none; user-select: none; }
   .pad:active, .pad.on { background: #2d6cdf; border-color: #2d6cdf; }
-  .stop { width: 130px; height: 44px; background: #4a1f24; border-color: #7a3038;
+  .stop { width: 110px; height: 42px; background: #4a1f24; border-color: #7a3038;
           font-weight: 700; letter-spacing: .04em; }
-  .stick { position: relative; width: 190px; height: 190px; border-radius: 50%;
-           background: radial-gradient(circle at 50% 50%, #1b232c 0%, #141a21 70%);
-           border: 1px solid #2a3947; touch-action: none; user-select: none; }
-  .knob { position: absolute; width: 64px; height: 64px; border-radius: 50%;
-          background: #2d6cdf; left: 63px; top: 63px; pointer-events: none;
-          box-shadow: 0 0 18px rgba(45,108,223,.55); }
-  #brush { padding: 8px 14px; border-radius: 8px; border: 1px solid #2a3947;
-           background: #1b232c; color: #e6e9ee; cursor: pointer; }
-  #brush.on { background: #2d6cdf; border-color: #2d6cdf; }
-  input[type=range] { vertical-align: middle; width: 130px; }
+  .slider-label { display: flex; align-items: center; gap: 8px;
+                  color: #8a94a0; font-size: 12px; text-transform: uppercase;
+                  letter-spacing: .06em; }
+  .slider-label input { width: 80px; }
 </style>
 
 <script>

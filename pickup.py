@@ -94,11 +94,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--hold", type=float, default=0.4, help="seconds per steering command"
     )
     parser.add_argument(
-        "--max-sweeps", type=int, default=5,
-        help="stop after this many brush passes, 0 for unlimited (default: 5)",
+        "--search",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="cast around when no leaf is visible instead of standing still "
+        "(default: on; use --no-search to wait in place)",
     )
     parser.add_argument(
-        "--steps", type=int, default=40, help="loop iterations, 0 for unlimited (default: 40)"
+        "--search-turn",
+        type=float,
+        default=5.0,
+        help="seconds of rotating in place before creeping forward (default: 5)",
+    )
+    parser.add_argument(
+        "--max-sweeps", type=int, default=3,
+        help="brush passes before giving up on one leaf and moving on; "
+        "0 never gives up (default: 3)",
+    )
+    parser.add_argument(
+        "--steps", type=int, default=0, help="loop iterations, 0 for unlimited (default: 0)"
     )
     parser.add_argument("--drive", action="store_true", help="energise the motors")
     parser.add_argument("--preview", action="store_true")
@@ -155,6 +169,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     speed = args.speed / 100.0
+    # Casting around is slower than approaching, so the robot hunts at a lower
+    # duty cycle and does not overshoot a leaf that is just off to one side.
+    search_speed = speed * 0.4
     brush_speed = args.brush_speed / 100.0
     brush_second = -brush_speed if BRUSH_OPPOSED else brush_speed
     params = DriveParams(v_max=speed, stop_height_ratio=args.close)
@@ -167,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"camera backend: {camera.backend}   detector: {args.backend} ({source})")
 
     sweeps = 0
+    search_started: float | None = None
     last_frame = None
 
     with ExitStack() as stack:
@@ -198,10 +216,32 @@ def main(argv: list[str] | None = None) -> int:
                     target, frame.shape[1], frame.shape[0], params
                 )
 
+                # Seeing a leaf means the hunt is over; restart the rotation clock.
+                if target is not None:
+                    search_started = None
+
                 if target is None:
-                    # Leaf gone: stop and wait for the next look.
-                    state = "no leaf - stopped"
-                    left = right = 0.0
+                    # Nothing in view. A new leaf gets a fresh budget of brush passes.
+                    if sweeps:
+                        sweeps = 0
+
+                    if args.search:
+                        # Rotate in place first. If a full sweep of the view turns
+                        # up nothing, creep forward and sweep again, which walks
+                        # the robot onto fresh ground instead of spinning on one spot.
+                        if search_started is None:
+                            search_started = time.monotonic()
+                        if time.monotonic() - search_started >= args.search_turn:
+                            state = "searching: creeping forward"
+                            left = right = search_speed * 1.2
+                            search_started = time.monotonic()
+                        else:
+                            state = "searching: rotating"
+                            left, right = -search_speed, search_speed
+                    else:
+                        state = "no leaf - stopped"
+                        left = right = 0.0
+
                     sweeping = False
 
                 elif "arrived" in note:
@@ -233,9 +273,21 @@ def main(argv: list[str] | None = None) -> int:
                         time.sleep(args.sweep_time)
                         robot.stop()
                         brush.stop()
+
                     if args.max_sweeps > 0 and sweeps >= args.max_sweeps:
-                        print("reached --max-sweeps, stopping")
-                        break
+                        # This leaf is not shifting. Rather than ending the run,
+                        # back off and turn away so it is not retargeted, then
+                        # carry on looking for the next leaf.
+                        print(
+                            f"gave up on this leaf after {sweeps} sweeps; moving on"
+                        )
+                        if robot is not None:
+                            robot.drive(-speed * 0.6, -speed * 0.6)
+                            time.sleep(args.sweep_time * 0.4)
+                            robot.drive(-speed * 0.5, speed * 0.5)
+                            time.sleep(args.sweep_time * 0.6)
+                            robot.stop()
+                        sweeps = 0
                     continue
 
                 if robot is not None and (left or right):
