@@ -115,6 +115,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "(upside-down mount), horizontal mirrors left/right, both rotates 180 "
         "degrees, none leaves the frame as captured (default: vertical)",
     )
+    parser.add_argument(
+        "--k-angle", type=float, default=DriveParams.k_angle, help="turn gain"
+    )
+    parser.add_argument(
+        "--k-linear",
+        type=float,
+        default=DriveParams.k_linear,
+        help="scales forward speed, so a centred target is approached at "
+        "k-linear x --speed (default: 0.9)",
+    )
     args = parser.parse_args(argv)
 
     if not 1 <= args.speed <= 100:
@@ -166,7 +176,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"could not build the detector: {exc}", file=sys.stderr)
         return 1
 
-    params = DriveParams(v_max=args.speed / 100.0, stop_height_ratio=args.close)
+    params = DriveParams(
+        k_angle=args.k_angle,
+        k_linear=args.k_linear,
+        v_max=args.speed / 100.0,
+        stop_height_ratio=args.close,
+    )
 
     camera = Camera(args.width, args.height, args.flip)
     if args.backend == "roboflow":

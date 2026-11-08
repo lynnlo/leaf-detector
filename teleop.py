@@ -99,11 +99,11 @@ class Teleop:
                 self.robot.drive(left, right)
 
             if self.brush is not None and brush_on != self._brush_applied:
-                            if brush_on:
-                                self.brush.drive(self.brush_speed)
-                            else:
-                                self.brush.stop()
-                            self._brush_applied = brush_on
+                if brush_on:
+                    self.brush.drive(self.brush_speed)
+                else:
+                    self.brush.stop()
+                self._brush_applied = brush_on
 
             with self._lock:
                 self._left, self._right = left, right
