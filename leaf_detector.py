@@ -298,36 +298,61 @@ class OnnxLeafDetector:
         return self.postprocess(raw, ratio, pad_x, pad_y, frame.shape)
 
 
-def _looks_like_predictions(value: object) -> bool:
-    """True when value is a list of detection dicts with the usual box fields."""
-    if not isinstance(value, list) or not value:
-        return False
-    first = value[0]
-    return isinstance(first, dict) and {"x", "y", "width", "height", "confidence"} <= set(first)
+_BOX_FIELDS = frozenset({"x", "y", "width", "height", "confidence"})
+
+
+def _is_box_list(value: object) -> bool:
+    """True when value is a non-empty list of detection dicts."""
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and isinstance(value[0], dict)
+        and _BOX_FIELDS <= set(value[0])
+    )
+
+
+def _find_box_list(value: object) -> list[dict] | None:
+    """Search value, then one level inside it, for a non-empty detection list."""
+    if _is_box_list(value):
+        return value
+    if isinstance(value, dict):
+        for nested in value.values():
+            if _is_box_list(nested):
+                return nested
+    return None
 
 
 def extract_predictions(payload: object) -> list[dict]:
     """Find the detection list inside a workflow response.
 
-    The workflow names its output and the shape around it are read from the
-    payload rather than assumed, so a renamed output or an extra wrapper does
-    not break parsing.
+    The output's name and the wrappers around it are read from the payload
+    rather than assumed, so a renamed output or an extra layer does not break
+    parsing.
+
+    An empty scene is a normal result, not an error: the workflow reports it as
+    an empty list sitting beside the image metadata, which this returns as [].
     """
     outputs = payload.get("outputs") if isinstance(payload, dict) else None
     if not isinstance(outputs, list):
         raise RoboflowResponseError("workflow response has no 'outputs' list")
 
+    empty_result: list[dict] | None = None
     for entry in outputs:
         if not isinstance(entry, dict):
             continue
         for value in entry.values():
-            if _looks_like_predictions(value):
-                return value
-            if isinstance(value, dict):
+            found = _find_box_list(value)
+            if found is not None:
+                return found
+            if isinstance(value, dict) and "image" in value:
+                # The detection list is always paired with the image it refers
+                # to, even when that list is empty.
                 for nested in value.values():
-                    if _looks_like_predictions(nested):
-                        return nested
+                    if isinstance(nested, list) and not nested:
+                        empty_result = nested
 
+    if empty_result is not None:
+        return empty_result
     raise RoboflowResponseError("workflow response contained no detection list")
 
 
