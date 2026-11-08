@@ -241,6 +241,161 @@ def annotate(
     return canvas
 
 
+@dataclass
+class LoopOptions:
+    """Tunables for drive_loop, gathered from whichever script is running."""
+
+    steps: int = 0
+    hold: float = 0.4
+    search: bool = True
+    search_turn: float = 5.0
+    max_sweeps: int = 0
+    sweep_time: float = 1.5
+    brush_speed: float = 1.0
+    preview: bool = False
+    save: str | Path | None = None
+    stop_on_arrival: bool = False
+
+
+def drive_loop(
+    camera,
+    detector,
+    params: DriveParams,
+    options: LoopOptions,
+    driver: L298N | None = None,
+    brush: L298N | None = None,
+) -> int:
+    """Look for leaves, steer at them, and handle them until stopped.
+
+    One cycle reads a frame, runs the detector, picks the nearest leaf and turns
+    it into wheel speeds. With nothing in view the robot casts around: it
+    rotates in place, and creeps forward when a full sweep of the view finds
+    nothing, which takes it onto fresh ground instead of spinning on one spot.
+
+    On reaching a leaf it sweeps when a brush is fitted, then backs off so the
+    same leaf is not immediately retargeted. With no brush it simply backs off.
+
+    Runs until the step budget is exhausted or the operator interrupts, so
+    steps=0 keeps going indefinitely. Returns a process exit code.
+    """
+    search_speed = params.v_max * 0.4
+    total = str(options.steps) if options.steps > 0 else "inf"
+    steps = range(options.steps) if options.steps > 0 else count()
+
+    sweeps = 0
+    search_started: float | None = None
+    last_frame = None
+
+    try:
+        for step in steps:
+            frame = camera.read()
+            detections = detector.detect(frame)
+            target = choose_target(detections)
+            left, right, note = compute_command(
+                target, frame.shape[1], frame.shape[0], params
+            )
+
+            # Seeing a leaf ends the hunt, so restart the rotation clock.
+            if target is not None:
+                search_started = None
+
+            sweeping = False
+
+            if target is None:
+                # A new leaf gets a fresh budget of brush passes.
+                sweeps = 0
+                if not options.search:
+                    state = "no leaf - stopped"
+                    left = right = 0.0
+                elif search_started is None:
+                    search_started = time.monotonic()
+                    state = "searching: rotating"
+                    left, right = -search_speed, search_speed
+                elif time.monotonic() - search_started >= options.search_turn:
+                    state = "searching: creeping forward"
+                    left = right = search_speed * 1.2
+                    search_started = time.monotonic()
+                else:
+                    state = "searching: rotating"
+                    left, right = -search_speed, search_speed
+
+            elif "arrived" in note:
+                sweeps += 1
+                if options.stop_on_arrival:
+                    state = "arrived"
+                else:
+                    sweeping = True
+                    state = (
+                        f"sweeping ({sweeps}/{options.max_sweeps})"
+                        if options.max_sweeps > 0
+                        else f"sweeping ({sweeps})"
+                    )
+
+            else:
+                state = "approaching"
+
+            print(
+                f"[{step + 1}/{total}] {state:<24} {note}  "
+                f"L={left:+.2f} R={right:+.2f}"
+            )
+
+            last_frame = annotate(frame, detections, target, state)
+            if options.preview:
+                cv2.imshow("leaf-dec", last_frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+
+            if options.stop_on_arrival and state == "arrived":
+                print("target reached")
+                break
+
+            if sweeping:
+                limit = options.max_sweeps
+                reached_limit = limit > 0 and sweeps >= limit
+
+                if driver is not None and brush is not None:
+                    brush.drive(options.brush_speed)
+                    driver.drive(params.v_max * 0.6, params.v_max * 0.6)
+                    time.sleep(options.sweep_time)
+                    driver.stop()
+                    brush.stop()
+
+                if reached_limit:
+                    print(f"gave up on this leaf after {sweeps} sweeps; moving on")
+                    if driver is not None:
+                        # Back off, then pivot, so the leaf drops out of frame
+                        # instead of being swept again straight away.
+                        driver.drive(-params.v_max * 0.6, -params.v_max * 0.6)
+                        time.sleep(options.sweep_time * 0.4)
+                        driver.drive(-params.v_max * 0.5, params.v_max * 0.5)
+                        time.sleep(options.sweep_time * 0.6)
+                        driver.stop()
+                    sweeps = 0
+                continue
+
+            if driver is not None and (left or right):
+                driver.drive(left, right)
+                time.sleep(options.hold)
+                driver.stop()
+
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+    finally:
+        if driver is not None:
+            driver.stop()
+        if brush is not None:
+            brush.stop()
+        camera.close()
+        detector.close()
+        if options.preview:
+            cv2.destroyAllWindows()
+        if options.save and last_frame is not None:
+            cv2.imwrite(str(options.save), last_frame)
+            print(f"saved {options.save}")
+
+    return 0
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Detect leaves from the Pi camera and steer toward them."
@@ -341,8 +496,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--search",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="cast around when no leaf is visible instead of stopping "
+        "(default: on; use --no-search to wait in place)",
+    )
+    parser.add_argument(
+        "--search-turn",
+        type=float,
+        default=5.0,
+        help="seconds of rotating in place before creeping forward (default: 5)",
+    )
+    parser.add_argument(
+        "--stop-on-arrival",
         action="store_true",
-        help="rotate in place when no leaf is visible instead of stopping",
+        help="stop at the first leaf reached instead of backing off and moving on",
     )
     parser.add_argument("--preview", action="store_true", help="show an annotated window")
     parser.add_argument("--save", metavar="PATH", help="write the annotated last frame")
@@ -413,65 +581,24 @@ def main(argv: list[str] | None = None) -> int:
         source = args.model.name
     print(f"camera backend: {camera.backend}   detector: {args.backend} ({source})")
 
+    options = LoopOptions(
+        steps=args.steps,
+        hold=args.hold,
+        search=args.search,
+        search_turn=args.search_turn,
+        # No brush on this build, so one pass counts as "handled" and the robot
+        # backs off to hunt for the next leaf instead of idling on this one.
+        max_sweeps=1,
+        preview=args.preview,
+        save=args.save,
+        stop_on_arrival=args.stop_on_arrival,
+    )
+
     with ExitStack() as stack:
         driver = L298N(stack) if args.drive else None
         if driver is None:
             print("dry run: motors are not energised (pass --drive to move)")
-
-        search_speed = params.v_max * 0.4
-        last_frame: np.ndarray | None = None
-
-        try:
-            # --steps 0 looks for leaves until interrupted instead of stopping
-            # after a fixed number of cycles.
-            total = str(args.steps) if args.steps > 0 else "inf"
-            steps = range(args.steps) if args.steps > 0 else count()
-            for step in steps:
-                frame = camera.read()
-                detections = detector.detect(frame)
-                target = choose_target(detections)
-                left, right, note = compute_command(
-                    target, frame.shape[1], frame.shape[0], params
-                )
-
-                if target is None and args.search:
-                    left, right = -search_speed, search_speed
-                    note = "searching: rotating in place"
-                
-                print(
-                    f"[{step + 1}/{total}] {note} "
-                    f"left={left:+.2f} right={right:+.2f}"
-                )
-
-                last_frame = annotate(frame, detections, target, note)
-                if args.preview:
-                    cv2.imshow("leaf-dec", last_frame)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        break
-
-                if driver is not None and (left or right):
-                    driver.drive(left, right)
-                    time.sleep(args.hold)
-                    driver.stop()
-
-                if target is not None and left == 0.0 and right == 0.0:
-                    print("target reached")
-                    break
-
-        except KeyboardInterrupt:
-            print("\nInterrupted.")
-        finally:
-            if driver is not None:
-                driver.stop()
-            camera.close()
-            detector.close()
-            if args.preview:
-                cv2.destroyAllWindows()
-            if args.save and last_frame is not None:
-                cv2.imwrite(args.save, last_frame)
-                print(f"saved {args.save}")
-
-    return 0
+        return drive_loop(camera, detector, params, options, driver=driver)
 
 
 if __name__ == "__main__":

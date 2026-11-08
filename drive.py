@@ -22,10 +22,11 @@ IN4_PIN = 6
 
 
 class L298N:
-    """Two motors on one L298N board.
+    """One or two motors on one L298N board.
 
-    The defaults are the drivetrain pins defined above. Pass pins explicitly when
-    a second board drives different motors, such as the pickup brushes.
+    The defaults wire both channels, which is what the drivetrain uses. Pass
+    enb/in3/in4 as None for a board that drives a single motor, so those three
+    pins are left free instead of being claimed with nothing attached.
     """
 
     def __init__(
@@ -34,16 +35,21 @@ class L298N:
         ena: int = ENA_PIN,
         in1: int = IN1_PIN,
         in2: int = IN2_PIN,
-        enb: int = ENB_PIN,
-        in3: int = IN3_PIN,
-        in4: int = IN4_PIN,
+        enb: int | None = ENB_PIN,
+        in3: int | None = IN3_PIN,
+        in4: int | None = IN4_PIN,
     ) -> None:
         self.ena = devices.enter_context(PWMOutputDevice(ena, initial_value=0))
         self.in1 = devices.enter_context(OutputDevice(in1, initial_value=False))
         self.in2 = devices.enter_context(OutputDevice(in2, initial_value=False))
-        self.enb = devices.enter_context(PWMOutputDevice(enb, initial_value=0))
-        self.in3 = devices.enter_context(OutputDevice(in3, initial_value=False))
-        self.in4 = devices.enter_context(OutputDevice(in4, initial_value=False))
+
+        # Channel B exists only when every one of its pins was supplied.
+        if enb is not None and in3 is not None and in4 is not None:
+            self.enb = devices.enter_context(PWMOutputDevice(enb, initial_value=0))
+            self.in3 = devices.enter_context(OutputDevice(in3, initial_value=False))
+            self.in4 = devices.enter_context(OutputDevice(in4, initial_value=False))
+        else:
+            self.enb = self.in3 = self.in4 = None
 
     @staticmethod
     def _set_motor(
@@ -56,9 +62,10 @@ class L298N:
         input_b.value = speed < 0
         enable.value = abs(speed)
 
-    def drive(self, left_speed: float, right_speed: float) -> None:
+    def drive(self, left_speed: float, right_speed: float = 0.0) -> None:
         self._set_motor(self.ena, self.in1, self.in2, left_speed)
-        self._set_motor(self.enb, self.in3, self.in4, right_speed)
+        if self.enb is not None:
+            self._set_motor(self.enb, self.in3, self.in4, right_speed)
 
     def stop(self) -> None:
         self.drive(0, 0)

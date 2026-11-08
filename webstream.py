@@ -14,8 +14,6 @@ import threading
 import time
 from pathlib import Path
 
-import cv2
-
 from capture import Camera, DriveParams, annotate, choose_target, compute_command
 from leaf_detector import (
     DEFAULT_CLASSES,
@@ -24,7 +22,7 @@ from leaf_detector import (
     RoboflowError,
     build_detector,
 )
-from webvideo import FrameSource, MjpegServer, page
+from webvideo import CameraPublisher, MjpegServer, page
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_MODEL = HERE / "models" / "leaf.onnx"
@@ -45,112 +43,91 @@ class AnnotatedFeed:
         self.camera = camera
         self.detector = detector
         self.detect_every = max(0.05, detect_every)
-        self.jpeg_quality = jpeg_quality
         self.params = params or DriveParams()
-        self.fps = max(1.0, fps)
 
-        self.source = FrameSource()
         self._lock = threading.Lock()
-        self._raw = None
         self._detections: list = []
         self._target = None
         self._note = "starting up"
-        self._stop = threading.Event()
-
-        self._fps = 0.0
         self._detect_ms = 0.0
         self._error = ""
+        self._stop = threading.Event()
+
+        # The publisher owns the camera read and the JPEG encode; this class only
+        # decides what to draw on each frame and when to run detection.
+        self.publisher = CameraPublisher(
+            camera, fps=fps, quality=jpeg_quality, render=self._render
+        )
+        self.source = self.publisher.source
 
     # -- background workers -------------------------------------------------
+    def _render(self, frame):
+        """Draw the newest detection result onto a frame before it is encoded."""
+        with self._lock:
+            detections, target, note = self._detections, self._target, self._note
+        return annotate(frame, detections, target, note)
+
     def _detect_loop(self) -> None:
         while not self._stop.is_set():
-            with self._lock:
-                frame = None if self._raw is None else self._raw.copy()
+            frame = self.publisher.latest_raw()
 
-            if frame is not None:
-                started = time.time()
-                try:
-                    detections = self.detector.detect(frame)
-                    target = choose_target(detections)
-                    _, _, note = compute_command(
-                        target, frame.shape[1], frame.shape[0], self.params
-                    )
-                    error = ""
-                except RoboflowError as exc:
-                    # A network hiccup should dim the labels, not kill the video.
-                    detections, target, note = [], None, "detector unavailable"
-                    error = str(exc)
-                except Exception as exc:  # noqa: BLE001 - keep the feed alive
-                    detections, target, note = [], None, "detector error"
-                    error = f"{type(exc).__name__}: {exc}"
-
+            if frame is None:
                 with self._lock:
-                    self._detections = detections
-                    self._target = target
-                    self._note = note
-                    self._error = error
-                    self._detect_ms = (time.time() - started) * 1000.0
+                    self._note = "waiting for the camera"
+                self._stop.wait(self.detect_every)
+                continue
+
+            started = time.time()
+            try:
+                detections = self.detector.detect(frame)
+                target = choose_target(detections)
+                _, _, note = compute_command(
+                    target, frame.shape[1], frame.shape[0], self.params
+                )
+                error = ""
+            except RoboflowError as exc:
+                # A network hiccup should dim the labels, not kill the video.
+                detections, target, note = [], None, "detector unavailable"
+                error = str(exc)
+            except Exception as exc:  # noqa: BLE001 - keep the feed alive
+                detections, target, note = [], None, "detector error"
+                error = f"{type(exc).__name__}: {exc}"
+
+            with self._lock:
+                self._detections = detections
+                self._target = target
+                self._note = note
+                self._error = error
+                self._detect_ms = (time.time() - started) * 1000.0
 
             self._stop.wait(self.detect_every)
 
-    def _render_loop(self) -> None:
-        interval = 1.0 / self.fps
-        frame_times: list[float] = []
-        while not self._stop.is_set():
-            started = time.time()
-            try:
-                frame = self.camera.read()
-            except Exception as exc:  # noqa: BLE001 - surface, don't crash
-                with self._lock:
-                    self._note = f"camera error: {exc}"
-                self._stop.wait(1.0)
-                continue
-
-            with self._lock:
-                self._raw = frame
-                detections, target, note = self._detections, self._target, self._note
-
-            canvas = annotate(frame, detections, target, note)
-            ok, buffer = cv2.imencode(
-                ".jpg", canvas, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
-            )
-            if ok:
-                self.source.publish(buffer.tobytes())
-
-            now = time.time()
-            frame_times.append(now)
-            frame_times = [t for t in frame_times if now - t < 2.0]
-            with self._lock:
-                self._fps = len(frame_times) / 2.0
-
-            # Cap the publish rate: an uncapped loop would spin far faster than
-            # the sensor and flood the network without improving the picture.
-            remaining = interval - (time.time() - started)
-            if remaining > 0:
-                self._stop.wait(remaining)
-
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> None:
-        self._threads = [
-            threading.Thread(target=self._render_loop, name="render", daemon=True),
-            threading.Thread(target=self._detect_loop, name="detect", daemon=True),
-        ]
-        for thread in self._threads:
-            thread.start()
+        self.publisher.start()
+        self._thread = threading.Thread(
+            target=self._detect_loop, name="detect", daemon=True
+        )
+        self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
+        self.publisher.stop()
 
     def stats(self) -> dict:
         with self._lock:
-            return {
-                "leaves": len(self._detections),
-                "note": self._note,
-                "fps": round(self._fps, 1),
-                "detect_ms": round(self._detect_ms),
-                "camera": self.camera.backend,
-                "error": self._error,
-            }
+            leaves = len(self._detections)
+            note = self._note
+            detect_ms = self._detect_ms
+            error = self._error
+        return {
+            "leaves": leaves,
+            "note": note,
+            "fps": round(self.publisher.measured_fps, 1),
+            "detect_ms": round(detect_ms),
+            "camera": self.camera.backend,
+            "error": error or self.publisher.error,
+        }
 
 
 def build_page() -> str:

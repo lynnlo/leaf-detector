@@ -1,13 +1,12 @@
-"""Drive to a detected leaf and sweep it up with two rotating brushes.
+"""Drive to a detected leaf and sweep it up with a rotating brush.
 
-Four motors across two L298N boards:
+Three motors across two L298N boards:
   * board 1 drives the two drivetrain motors
-  * board 2 drives the two brush motors
+  * board 2 drives the single brush motor on channel A
 
-Both boards use the same L298N class from drive.py; the second one is just
-constructed with different pins. The loop is deliberately short: steer toward
-the nearest leaf until it fills enough of the frame, then drive over it with the
-brushes spinning for a moment.
+Both boards use the same L298N class from drive.py; the second one is built with
+different pins and no second channel. The look-decide-drive cycle itself lives in
+capture.drive_loop, shared with capture.py, so the two scripts cannot drift apart.
 
 Motors only move when --drive is passed.
 """
@@ -17,14 +16,10 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import time
 from contextlib import ExitStack
-from itertools import count
 from pathlib import Path
 
-import cv2
-
-from capture import Camera, DriveParams, annotate, choose_target, compute_command
+from capture import Camera, DriveParams, LoopOptions, drive_loop
 from drive import L298N
 from leaf_detector import (
     DEFAULT_CLASSES,
@@ -37,16 +32,11 @@ from leaf_detector import (
 HERE = Path(__file__).resolve().parent
 DEFAULT_MODEL = HERE / "models" / "leaf.onnx"
 
-# Second L298N board: brush motor A and brush motor B. Remove both jumpers.
+# Second L298N board: one brush motor on channel A. Channel B is not used, so
+# its three pins (BCM 13, 19, 26) stay free. Remove this board's ENA jumper.
 BRUSH_ENA = 12
 BRUSH_IN1 = 16
 BRUSH_IN2 = 20
-BRUSH_ENB = 13
-BRUSH_IN3 = 19
-BRUSH_IN4 = 26
-
-# Set True if the two brushes face each other and must counter-rotate.
-BRUSH_OPPOSED = False
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -168,13 +158,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"could not build the detector: {exc}", file=sys.stderr)
         return 1
 
-    speed = args.speed / 100.0
-    # Casting around is slower than approaching, so the robot hunts at a lower
-    # duty cycle and does not overshoot a leaf that is just off to one side.
-    search_speed = speed * 0.4
-    brush_speed = args.brush_speed / 100.0
-    brush_second = -brush_speed if BRUSH_OPPOSED else brush_speed
-    params = DriveParams(v_max=speed, stop_height_ratio=args.close)
+    params = DriveParams(v_max=args.speed / 100.0, stop_height_ratio=args.close)
 
     camera = Camera(args.width, args.height)
     if args.backend == "roboflow":
@@ -183,9 +167,17 @@ def main(argv: list[str] | None = None) -> int:
         source = args.model.name
     print(f"camera backend: {camera.backend}   detector: {args.backend} ({source})")
 
-    sweeps = 0
-    search_started: float | None = None
-    last_frame = None
+    options = LoopOptions(
+        steps=args.steps,
+        hold=args.hold,
+        search=args.search,
+        search_turn=args.search_turn,
+        max_sweeps=args.max_sweeps,
+        sweep_time=args.sweep_time,
+        brush_speed=args.brush_speed / 100.0,
+        preview=args.preview,
+        save=args.save,
+    )
 
     with ExitStack() as stack:
         if args.drive:
@@ -195,121 +187,15 @@ def main(argv: list[str] | None = None) -> int:
                 ena=BRUSH_ENA,
                 in1=BRUSH_IN1,
                 in2=BRUSH_IN2,
-                enb=BRUSH_ENB,
-                in3=BRUSH_IN3,
-                in4=BRUSH_IN4,
+                enb=None,
+                in3=None,
+                in4=None,
             )
         else:
             robot = brush = None
             print("dry run: motors are not energised (pass --drive to move)")
 
-        try:
-            # --steps 0 sweeps leaves until interrupted rather than stopping
-            # after a fixed number of cycles.
-            total = str(args.steps) if args.steps > 0 else "inf"
-            steps = range(args.steps) if args.steps > 0 else count()
-            for step in steps:
-                frame = camera.read()
-                detections = detector.detect(frame)
-                target = choose_target(detections)
-                left, right, note = compute_command(
-                    target, frame.shape[1], frame.shape[0], params
-                )
-
-                # Seeing a leaf means the hunt is over; restart the rotation clock.
-                if target is not None:
-                    search_started = None
-
-                if target is None:
-                    # Nothing in view. A new leaf gets a fresh budget of brush passes.
-                    if sweeps:
-                        sweeps = 0
-
-                    if args.search:
-                        # Rotate in place first. If a full sweep of the view turns
-                        # up nothing, creep forward and sweep again, which walks
-                        # the robot onto fresh ground instead of spinning on one spot.
-                        if search_started is None:
-                            search_started = time.monotonic()
-                        if time.monotonic() - search_started >= args.search_turn:
-                            state = "searching: creeping forward"
-                            left = right = search_speed * 1.2
-                            search_started = time.monotonic()
-                        else:
-                            state = "searching: rotating"
-                            left, right = -search_speed, search_speed
-                    else:
-                        state = "no leaf - stopped"
-                        left = right = 0.0
-
-                    sweeping = False
-
-                elif "arrived" in note:
-                    # Close enough: drive over it with the brushes spinning.
-                    sweeps += 1
-                    state = (
-                        f"sweeping ({sweeps}/{args.max_sweeps})"
-                        if args.max_sweeps > 0
-                        else f"sweeping ({sweeps})"
-                    )
-                    sweeping = True
-
-                else:
-                    state = "approaching"
-                    sweeping = False
-
-                print(f"[{step + 1}/{total}] {state:<22} {note}")
-
-                last_frame = annotate(frame, detections, target, state)
-                if args.preview:
-                    cv2.imshow("leaf-dec", last_frame)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        break
-
-                if sweeping:
-                    if robot is not None:
-                        brush.drive(brush_speed, brush_second)
-                        robot.drive(speed * 0.6, speed * 0.6)
-                        time.sleep(args.sweep_time)
-                        robot.stop()
-                        brush.stop()
-
-                    if args.max_sweeps > 0 and sweeps >= args.max_sweeps:
-                        # This leaf is not shifting. Rather than ending the run,
-                        # back off and turn away so it is not retargeted, then
-                        # carry on looking for the next leaf.
-                        print(
-                            f"gave up on this leaf after {sweeps} sweeps; moving on"
-                        )
-                        if robot is not None:
-                            robot.drive(-speed * 0.6, -speed * 0.6)
-                            time.sleep(args.sweep_time * 0.4)
-                            robot.drive(-speed * 0.5, speed * 0.5)
-                            time.sleep(args.sweep_time * 0.6)
-                            robot.stop()
-                        sweeps = 0
-                    continue
-
-                if robot is not None and (left or right):
-                    robot.drive(left, right)
-                    time.sleep(args.hold)
-                    robot.stop()
-
-        except KeyboardInterrupt:
-            print("\nInterrupted.")
-        finally:
-            if robot is not None:
-                robot.stop()
-                brush.stop()
-            camera.close()
-            detector.close()
-            if args.preview:
-                cv2.destroyAllWindows()
-            if args.save and last_frame is not None:
-                cv2.imwrite(args.save, last_frame)
-                print(f"saved {args.save}")
-
-    return 0
+        return drive_loop(camera, detector, params, options, driver=robot, brush=brush)
 
 
 if __name__ == "__main__":

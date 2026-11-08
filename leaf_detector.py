@@ -293,6 +293,8 @@ class OnnxLeafDetector:
 
     def detect(self, frame: np.ndarray) -> list[Detection]:
         """Run inference on one BGR frame and return its detections."""
+        if self.session is None:
+            raise RuntimeError("this detector has already been closed")
         tensor, ratio, pad_x, pad_y = self.preprocess(frame)
         raw = self.session.run(None, {self.input_name: tensor})[0]
         return self.postprocess(raw, ratio, pad_x, pad_y, frame.shape)

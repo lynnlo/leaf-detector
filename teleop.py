@@ -13,23 +13,15 @@ import argparse
 import threading
 import time
 from contextlib import ExitStack
-from pathlib import Path
-
-import cv2
-import numpy as np
 
 from capture import Camera
 from drive import L298N
-from webvideo import FrameSource, MjpegServer, page
+from webvideo import CameraPublisher, MjpegServer, page
 
-# Second L298N board, the rotating brushes.
+# Second L298N board: one brush motor on channel A. Channel B is unused.
 BRUSH_ENA = 12
 BRUSH_IN1 = 16
 BRUSH_IN2 = 20
-BRUSH_ENB = 13
-BRUSH_IN3 = 19
-BRUSH_IN4 = 26
-BRUSH_OPPOSED = False
 
 
 def _clamp(value: float) -> float:
@@ -107,12 +99,11 @@ class Teleop:
                 self.robot.drive(left, right)
 
             if self.brush is not None and brush_on != self._brush_applied:
-                if brush_on:
-                    second = -self.brush_speed if BRUSH_OPPOSED else self.brush_speed
-                    self.brush.drive(self.brush_speed, second)
-                else:
-                    self.brush.stop()
-                self._brush_applied = brush_on
+                            if brush_on:
+                                self.brush.drive(self.brush_speed)
+                            else:
+                                self.brush.stop()
+                            self._brush_applied = brush_on
 
             with self._lock:
                 self._left, self._right = left, right
@@ -207,7 +198,7 @@ def build_page() -> str:
   .pad:active, .pad.on { background: #2d6cdf; border-color: #2d6cdf; }
   .stop { width: 110px; height: 42px; background: #4a1f24; border-color: #7a3038;
           font-weight: 700; letter-spacing: .04em; }
-  .stop { width: 110px; height: 42px; background: #241f4a; border-color: #38307a;
+  .brush { width: 110px; height: 42px; background: #241f4a; border-color: #38307a;
             font-weight: 700; letter-spacing: .04em; }
   .slider-label { display: flex; align-items: center; gap: 8px;
                   color: #8a94a0; font-size: 12px; text-transform: uppercase;
@@ -391,29 +382,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     camera = Camera(args.width, args.height)
-    source = FrameSource()
-    stop = threading.Event()
-
-    def camera_loop() -> None:
-        interval = 1.0 / max(1.0, args.fps)
-        while not stop.is_set():
-            started = time.time()
-            try:
-                frame = camera.read()
-            except Exception:  # noqa: BLE001 - keep serving, retry the camera
-                stop.wait(0.5)
-                continue
-            ok, buffer = cv2.imencode(
-                ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), args.quality]
-            )
-            if ok:
-                source.publish(buffer.tobytes())
-            # Cap the rate so a fast camera cannot saturate the network.
-            remaining = interval - (time.time() - started)
-            if remaining > 0:
-                stop.wait(remaining)
-
-    threading.Thread(target=camera_loop, name="camera", daemon=True).start()
+    publisher = CameraPublisher(camera, fps=args.fps, quality=args.quality)
+    publisher.start()
 
     with ExitStack() as stack:
         robot = L298N(stack) if args.drive else None
@@ -423,9 +393,9 @@ def main(argv: list[str] | None = None) -> int:
                 ena=BRUSH_ENA,
                 in1=BRUSH_IN1,
                 in2=BRUSH_IN2,
-                enb=BRUSH_ENB,
-                in3=BRUSH_IN3,
-                in4=BRUSH_IN4,
+                enb=None,
+                in3=None,
+                in4=None,
             )
             if args.drive
             else None
@@ -467,7 +437,7 @@ def main(argv: list[str] | None = None) -> int:
             handler.send_json({"ok": True, "speed": teleop.speed})
 
         server = MjpegServer(
-            source,
+            publisher.source,
             get_routes={
                 "/": lambda handler: handler.send_html(build_page()),
                 "/stream": lambda handler: handler.stream_mjpeg(),
@@ -489,7 +459,7 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             print("\nStopping.")
         finally:
-            stop.set()
+            publisher.stop()
             teleop.stop()
             server.server_close()
             camera.close()

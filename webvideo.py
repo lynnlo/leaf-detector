@@ -10,8 +10,11 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
+
+import cv2
 
 BOUNDARY = "frame"
 
@@ -129,6 +132,81 @@ class _Handler(BaseHTTPRequestHandler):
             # a dropped WiFi link. BrokenPipe, ConnectionReset and Windows'
             # ConnectionAborted all fall under OSError, and all just end here.
             return
+
+
+class CameraPublisher:
+    """Reads a camera on a background thread and publishes JPEG frames.
+
+    Caps the read rate so a fast sensor cannot saturate the network, and keeps
+    the newest BGR frame available so a caller can run detection against it
+    without touching the camera itself. `render` may annotate a frame before it
+    is encoded; returning None falls back to the raw frame.
+    """
+
+    def __init__(
+        self,
+        camera,
+        fps: float = 15.0,
+        quality: int = 80,
+        render: Callable | None = None,
+    ) -> None:
+        self.camera = camera
+        self.fps = max(1.0, fps)
+        self.quality = quality
+        self.render = render
+        self.source = FrameSource()
+        self.error = ""
+        self.measured_fps = 0.0
+
+        self._lock = threading.Lock()
+        self._raw = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def latest_raw(self):
+        """The most recent BGR frame, or None before the first successful read."""
+        with self._lock:
+            return self._raw
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, name="camera", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _loop(self) -> None:
+        interval = 1.0 / self.fps
+        recent: list[float] = []
+        while not self._stop.is_set():
+            started = time.time()
+            try:
+                frame = self.camera.read()
+            except Exception as exc:  # noqa: BLE001 - keep serving, retry
+                self.error = f"{type(exc).__name__}: {exc}"
+                self._stop.wait(0.5)
+                continue
+            self.error = ""
+
+            with self._lock:
+                self._raw = frame
+
+            out = self.render(frame) if self.render is not None else frame
+            ok, buffer = cv2.imencode(
+                ".jpg",
+                frame if out is None else out,
+                [int(cv2.IMWRITE_JPEG_QUALITY), self.quality],
+            )
+            if ok:
+                self.source.publish(buffer.tobytes())
+                now = time.time()
+                recent.append(now)
+                recent = [t for t in recent if now - t < 2.0]
+                self.measured_fps = len(recent) / 2.0
+
+            remaining = interval - (time.time() - started)
+            if remaining > 0:
+                self._stop.wait(remaining)
 
 
 class MjpegServer(ThreadingHTTPServer):
