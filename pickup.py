@@ -107,6 +107,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--drive", action="store_true", help="energise the motors")
     parser.add_argument("--preview", action="store_true")
     parser.add_argument("--save", metavar="PATH")
+    parser.add_argument(
+        "--flip",
+        choices=["none", "vertical", "horizontal", "both"],
+        default="vertical",
+        help="correct for the camera's mounting: vertical swaps top/bottom "
+        "(upside-down mount), horizontal mirrors left/right, both rotates 180 "
+        "degrees, none leaves the frame as captured (default: vertical)",
+    )
     args = parser.parse_args(argv)
 
     if not 1 <= args.speed <= 100:
@@ -160,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
 
     params = DriveParams(v_max=args.speed / 100.0, stop_height_ratio=args.close)
 
-    camera = Camera(args.width, args.height)
+    camera = Camera(args.width, args.height, args.flip)
     if args.backend == "roboflow":
         source = f"workflow {args.workflow_id[:44]}"
     else:

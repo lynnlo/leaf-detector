@@ -361,6 +361,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--drive", action="store_true", help="energise the motors; without it nothing moves"
     )
+    parser.add_argument(
+        "--flip",
+        choices=["none", "vertical", "horizontal", "both"],
+        default="vertical",
+        help="correct for the camera's mounting: vertical swaps top/bottom "
+        "(upside-down mount), horizontal mirrors left/right, both rotates 180 "
+        "degrees, none leaves the frame as captured (default: vertical)",
+    )
     args = parser.parse_args(argv)
 
     if not 0 < args.port < 65536:
@@ -381,7 +389,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    camera = Camera(args.width, args.height)
+    camera = Camera(args.width, args.height, args.flip)
     publisher = CameraPublisher(camera, fps=args.fps, quality=args.quality)
     publisher.start()
 

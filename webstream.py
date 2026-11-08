@@ -193,6 +193,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--fps", type=float, default=15.0,
         help="maximum streamed frames per second (default: 15)",
     )
+    parser.add_argument(
+        "--flip",
+        choices=["none", "vertical", "horizontal", "both"],
+        default="vertical",
+        help="correct for the camera's mounting: vertical swaps top/bottom "
+        "(upside-down mount), horizontal mirrors left/right, both rotates 180 "
+        "degrees, none leaves the frame as captured (default: vertical)",
+    )
     args = parser.parse_args(argv)
 
     if not 0 < args.port < 65536:
@@ -239,7 +247,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"could not build the detector: {exc}", file=sys.stderr)
         return 1
 
-    camera = Camera(args.width, args.height)
+    camera = Camera(args.width, args.height, args.flip)
     feed = AnnotatedFeed(
         camera,
         detector,

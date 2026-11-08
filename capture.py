@@ -54,11 +54,32 @@ class DriveParams:
 
 
 class Camera:
-    """Source of BGR frames, preferring picamera2 and falling back to rpicam-still."""
+    """Source of BGR frames, preferring picamera2 and falling back to rpicam-still.
+
+    How the camera is mounted decides which way up a frame arrives, so `flip`
+    corrects it once, as frames enter the program. Detection, annotation and the
+    web feeds then all see the same upright frame, which keeps drawn boxes over
+    the leaf they belong to.
+
+    The modes match cv2.flip's codes: "vertical" swaps top and bottom, which is
+    what an upside-down mount needs; "horizontal" mirrors left and right, which
+    also negates the steering offset and so drives the robot the other way;
+    "both" rotates 180 degrees, which is the correct fix for a camera mounted
+    entirely the wrong way round.
+    """
     
-    def __init__(self, width: int, height: int) -> None:
+    FLIP_CODES = {"none": None, "vertical": 0, "horizontal": 1, "both": -1}
+
+    def __init__(self, width: int, height: int, flip: str = "vertical") -> None:
+        if flip not in self.FLIP_CODES:
+            raise ValueError(
+                f"unknown flip mode {flip!r}; expected one of "
+                f"{', '.join(self.FLIP_CODES)}"
+            )
         self.width = width
         self.height = height
+        self.flip = flip
+        self._flip_code = self.FLIP_CODES[flip]
         self._picam = None
         self.backend = "rpicam-still"
 
@@ -93,6 +114,14 @@ class Camera:
         self.backend = "picamera2"
 
     def read(self) -> np.ndarray:
+        """One BGR frame, already corrected for how the camera is mounted."""
+        frame = self._grab()
+        if self._flip_code is not None:
+            frame = cv2.flip(frame, self._flip_code)
+        return frame
+
+    def _grab(self) -> np.ndarray:
+        """One BGR frame exactly as the backend delivers it."""
         if self._picam is not None:
             return self._picam.capture_array()
 
@@ -514,6 +543,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--preview", action="store_true", help="show an annotated window")
     parser.add_argument("--save", metavar="PATH", help="write the annotated last frame")
+    parser.add_argument(
+        "--flip",
+        choices=["none", "vertical", "horizontal", "both"],
+        default="vertical",
+        help="correct for the camera's mounting: vertical swaps top/bottom "
+        "(upside-down mount), horizontal mirrors left/right, both rotates 180 "
+        "degrees, none leaves the frame as captured (default: vertical)",
+    )
     args = parser.parse_args(argv)
 
     if not 1 <= args.speed <= 100:
@@ -574,7 +611,7 @@ def main(argv: list[str] | None = None) -> int:
         stop_height_ratio=args.stop_height,
     )
 
-    camera = Camera(args.width, args.height)
+    camera = Camera(args.width, args.height, args.flip)
     if args.backend == "roboflow":
         source = f"workflow {args.workflow_id[:44]}"
     else:
