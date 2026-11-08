@@ -16,6 +16,7 @@ it would send and leaves the wheels still.
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -27,7 +28,14 @@ import cv2
 import numpy as np
 
 from drive import L298N
-from leaf_detector import DEFAULT_CLASSES, Detection, OnnxLeafDetector
+from leaf_detector import (
+    DEFAULT_CLASSES,
+    DEFAULT_WORKFLOW_ID,
+    DEFAULT_WORKSPACE,
+    Detection,
+    RoboflowError,
+    build_detector,
+)
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_MODEL = HERE / "models" / "leaf.onnx"
@@ -46,7 +54,7 @@ class DriveParams:
 
 class Camera:
     """Source of BGR frames, preferring picamera2 and falling back to rpicam-still."""
-
+    
     def __init__(self, width: int, height: int) -> None:
         self.width = width
         self.height = height
@@ -56,15 +64,30 @@ class Camera:
         try:
             from picamera2 import Picamera2
         except ImportError:
+            print(
+                "picamera2 is not installed; using the rpicam-still fallback",
+                file=sys.stderr,
+            )
             return
 
-        picam = Picamera2()
-        config = picam.create_video_configuration(
-            main={"size": (width, height), "format": "BGR888"}
-        )
-        picam.configure(config)
-        picam.start()
-        time.sleep(0.5)  # Let auto-exposure settle before the first frame.
+        # libcamera reports missing or busy cameras as a plain RuntimeError, so a
+        # broad catch here is deliberate: the point is to fall back rather than
+        # abort with a traceback.
+        try:
+            picam = Picamera2()
+            config = picam.create_video_configuration(
+                main={"size": (width, height), "format": "BGR888"}
+            )
+            picam.configure(config)
+            picam.start()
+            time.sleep(0.5)  # Let auto-exposure settle before the first frame.
+        except Exception as exc:
+            print(
+                f"picamera2 could not start ({exc}); using the rpicam-still fallback",
+                file=sys.stderr,
+            )
+            return
+
         self._picam = picam
         self.backend = "picamera2"
 
@@ -88,9 +111,16 @@ class Camera:
                 "-",
             ],
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=True,
+            stderr=subprocess.PIPE,
+            check=False,
         )
+        if result.returncode != 0:
+            lines = result.stderr.decode("utf-8", "replace").strip().splitlines()
+            detail = lines[-1] if lines else "no output"
+            raise RuntimeError(
+                f"rpicam-still failed with exit code {result.returncode}: {detail}"
+            )
+
         frame = cv2.imdecode(np.frombuffer(result.stdout, np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             raise RuntimeError("rpicam-still produced no decodable frame")
@@ -125,7 +155,8 @@ def compute_command(
     A positive horizontal offset means the target sits right of centre; the left
     wheel is then driven faster than the right, which rotates the chassis toward
     the target. Forward speed falls off as the target moves off-centre so the
-    robot turns before it drives.
+    robot turns before it drives, and is scaled by k_linear so a centred leaf is
+    approached at k_linear * v_max.
     """
     if detection is None:
         return 0.0, 0.0, "no leaf in view"
@@ -139,7 +170,7 @@ def compute_command(
     offset = max(-1.0, min(1.0, offset))
 
     turn = params.k_angle * offset
-    forward = params.v_max * (1.0 - min(abs(offset), 1.0))
+    forward = params.k_linear * params.v_max * (1.0 - min(abs(offset), 1.0))
 
     if abs(offset) <= params.center_tolerance:
         direction = "straight"
@@ -214,10 +245,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Detect leaves from the Pi camera and steer toward them."
     )
     parser.add_argument(
+        "--backend",
+        choices=["roboflow", "onnx"],
+        default="roboflow",
+        help="roboflow calls the hosted workflow over the network; onnx runs a "
+        "local export with no network (default: roboflow)",
+    )
+    parser.add_argument(
         "--model",
         type=Path,
         default=DEFAULT_MODEL,
-        help=f"ONNX weights (default: {DEFAULT_MODEL.relative_to(HERE)})",
+        help=f"ONNX weights, used by --backend onnx (default: {DEFAULT_MODEL.relative_to(HERE)})",
+    )
+    parser.add_argument(
+        "--api-key",
+        help="Roboflow API key; defaults to the ROBOFLOW_API_KEY environment variable",
+    )
+    parser.add_argument(
+        "--workspace",
+        default=DEFAULT_WORKSPACE,
+        help=f"Roboflow workspace slug (default: {DEFAULT_WORKSPACE})",
+    )
+    parser.add_argument(
+        "--workflow-id",
+        default=DEFAULT_WORKFLOW_ID,
+        help="Roboflow workflow slug",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=15.0,
+        help="seconds to wait for one workflow call (default: 15)",
     )
     parser.add_argument(
         "--classes",
@@ -263,7 +321,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--k-angle", type=float, default=DriveParams.k_angle, help="turn gain"
     )
     parser.add_argument(
-        "--k-linear", type=float, default=DriveParams.k_linear, help="forward gain"
+        "--k-linear",
+        type=float,
+        default=DriveParams.k_linear,
+        help="scales forward speed, so a centred target is approached at "
+        "k-linear x --speed (default: 0.9)",
     )
     parser.add_argument(
         "--stop-height",
@@ -287,32 +349,53 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     if not 1 <= args.speed <= 100:
         parser.error("--speed must be between 1 and 100")
+    if not 0.0 <= args.conf <= 1.0:
+        parser.error("--conf must be between 0 and 1")
+    if not 0.0 <= args.iou <= 1.0:
+        parser.error("--iou must be between 0 and 1")
+    if not 0.0 < args.stop_height <= 1.0:
+        parser.error("--stop-height must be greater than 0 and at most 1")
     return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    if not args.model.is_file():
-        print(f"ONNX model not found: {args.model}", file=sys.stderr)
+    if args.backend == "onnx":
+        if not args.model.is_file():
+            print(f"ONNX model not found: {args.model}", file=sys.stderr)
+            print(
+                "Export it on a desktop machine with:\n"
+                "  python export_for_pi.py models/leaf.pt --formats onnx --imgsz 320\n"
+                "then copy the .onnx file into models/.",
+                file=sys.stderr,
+            )
+            return 1
+    elif not (args.api_key or os.environ.get("ROBOFLOW_API_KEY")):
         print(
-            "Export it on a desktop machine with:\n"
-            "  python export_for_pi.py models/leaf.pt --formats onnx --imgsz 320\n"
-            "then copy the .onnx file into models/.",
+            "no Roboflow API key: set ROBOFLOW_API_KEY or pass --api-key",
             file=sys.stderr,
         )
         return 1
 
     try:
-        detector = OnnxLeafDetector(
-            args.model,
+        detector = build_detector(
+            args.backend,
+            model_path=args.model,
+            api_key=args.api_key,
+            workspace=args.workspace,
+            workflow_id=args.workflow_id,
             class_names=tuple(args.classes),
             confidence=args.conf,
             iou=args.iou,
             imgsz=args.imgsz,
+            timeout=args.timeout,
         )
-    except ImportError:
-        print("onnxruntime is not installed. Run: pip install onnxruntime", file=sys.stderr)
+    except ImportError as exc:
+        print(f"a dependency is missing: {exc}", file=sys.stderr)
+        return 1
+    except RoboflowError as exc:
+        print(f"could not build the detector: {exc}", file=sys.stderr)
         return 1
 
     params = DriveParams(
@@ -323,7 +406,11 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     camera = Camera(args.width, args.height)
-    print(f"camera backend: {camera.backend}   model: {args.model.name}")
+    if args.backend == "roboflow":
+        source = f"workflow {args.workflow_id[:44]}"
+    else:
+        source = args.model.name
+    print(f"camera backend: {camera.backend}   detector: {args.backend} ({source})")
 
     with ExitStack() as stack:
         driver = L298N(stack) if args.drive else None
@@ -345,7 +432,7 @@ def main(argv: list[str] | None = None) -> int:
                 if target is None and args.search:
                     left, right = -search_speed, search_speed
                     note = "searching: rotating in place"
-
+                
                 print(
                     f"[{step + 1}/{args.steps}] {note} "
                     f"left={left:+.2f} right={right:+.2f}"
@@ -372,6 +459,7 @@ def main(argv: list[str] | None = None) -> int:
             if driver is not None:
                 driver.stop()
             camera.close()
+            detector.close()
             if args.preview:
                 cv2.destroyAllWindows()
             if args.save and last_frame is not None:

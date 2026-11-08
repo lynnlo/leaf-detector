@@ -22,13 +22,28 @@ IN4_PIN = 6
 
 
 class L298N:
-    def __init__(self, devices: ExitStack) -> None:
-        self.ena = devices.enter_context(PWMOutputDevice(ENA_PIN, initial_value=0))
-        self.in1 = devices.enter_context(OutputDevice(IN1_PIN, initial_value=False))
-        self.in2 = devices.enter_context(OutputDevice(IN2_PIN, initial_value=False))
-        self.enb = devices.enter_context(PWMOutputDevice(ENB_PIN, initial_value=0))
-        self.in3 = devices.enter_context(OutputDevice(IN3_PIN, initial_value=False))
-        self.in4 = devices.enter_context(OutputDevice(IN4_PIN, initial_value=False))
+    """Two motors on one L298N board.
+
+    The defaults are the drivetrain pins defined above. Pass pins explicitly when
+    a second board drives different motors, such as the pickup brushes.
+    """
+
+    def __init__(
+        self,
+        devices: ExitStack,
+        ena: int = ENA_PIN,
+        in1: int = IN1_PIN,
+        in2: int = IN2_PIN,
+        enb: int = ENB_PIN,
+        in3: int = IN3_PIN,
+        in4: int = IN4_PIN,
+    ) -> None:
+        self.ena = devices.enter_context(PWMOutputDevice(ena, initial_value=0))
+        self.in1 = devices.enter_context(OutputDevice(in1, initial_value=False))
+        self.in2 = devices.enter_context(OutputDevice(in2, initial_value=False))
+        self.enb = devices.enter_context(PWMOutputDevice(enb, initial_value=0))
+        self.in3 = devices.enter_context(OutputDevice(in3, initial_value=False))
+        self.in4 = devices.enter_context(OutputDevice(in4, initial_value=False))
 
     @staticmethod
     def _set_motor(
