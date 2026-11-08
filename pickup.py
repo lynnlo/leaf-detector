@@ -19,6 +19,7 @@ import os
 import sys
 import time
 from contextlib import ExitStack
+from itertools import count
 from pathlib import Path
 
 import cv2
@@ -93,9 +94,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--hold", type=float, default=0.4, help="seconds per steering command"
     )
     parser.add_argument(
-        "--max-sweeps", type=int, default=5, help="give up after this many sweeps"
+        "--max-sweeps", type=int, default=5,
+        help="stop after this many brush passes, 0 for unlimited (default: 5)",
     )
-    parser.add_argument("--steps", type=int, default=40, help="loop iterations")
+    parser.add_argument(
+        "--steps", type=int, default=40, help="loop iterations, 0 for unlimited (default: 40)"
+    )
     parser.add_argument("--drive", action="store_true", help="energise the motors")
     parser.add_argument("--preview", action="store_true")
     parser.add_argument("--save", metavar="PATH")
@@ -182,7 +186,11 @@ def main(argv: list[str] | None = None) -> int:
             print("dry run: motors are not energised (pass --drive to move)")
 
         try:
-            for step in range(args.steps):
+            # --steps 0 sweeps leaves until interrupted rather than stopping
+            # after a fixed number of cycles.
+            total = str(args.steps) if args.steps > 0 else "inf"
+            steps = range(args.steps) if args.steps > 0 else count()
+            for step in steps:
                 frame = camera.read()
                 detections = detector.detect(frame)
                 target = choose_target(detections)
@@ -199,14 +207,18 @@ def main(argv: list[str] | None = None) -> int:
                 elif "arrived" in note:
                     # Close enough: drive over it with the brushes spinning.
                     sweeps += 1
-                    state = f"sweeping ({sweeps}/{args.max_sweeps})"
+                    state = (
+                        f"sweeping ({sweeps}/{args.max_sweeps})"
+                        if args.max_sweeps > 0
+                        else f"sweeping ({sweeps})"
+                    )
                     sweeping = True
 
                 else:
                     state = "approaching"
                     sweeping = False
 
-                print(f"[{step + 1}/{args.steps}] {state:<22} {note}")
+                print(f"[{step + 1}/{total}] {state:<22} {note}")
 
                 last_frame = annotate(frame, detections, target, state)
                 if args.preview:
@@ -221,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
                         time.sleep(args.sweep_time)
                         robot.stop()
                         brush.stop()
-                    if sweeps >= args.max_sweeps:
+                    if args.max_sweeps > 0 and sweeps >= args.max_sweeps:
                         print("reached --max-sweeps, stopping")
                         break
                     continue

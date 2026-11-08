@@ -22,6 +22,7 @@ import sys
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass
+from itertools import count
 from pathlib import Path
 
 import cv2
@@ -302,7 +303,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--height", type=int, default=480, help="capture height (default: 480)"
     )
     parser.add_argument(
-        "--steps", type=int, default=10, help="detect-and-drive cycles (default: 10)"
+        "--steps", type=int, default=10, help="detect-and-drive cycles, 0 for unlimited (default: 10)"
     )
     parser.add_argument(
         "--hold",
@@ -421,7 +422,11 @@ def main(argv: list[str] | None = None) -> int:
         last_frame: np.ndarray | None = None
 
         try:
-            for step in range(args.steps):
+            # --steps 0 looks for leaves until interrupted instead of stopping
+            # after a fixed number of cycles.
+            total = str(args.steps) if args.steps > 0 else "inf"
+            steps = range(args.steps) if args.steps > 0 else count()
+            for step in steps:
                 frame = camera.read()
                 detections = detector.detect(frame)
                 target = choose_target(detections)
@@ -434,7 +439,7 @@ def main(argv: list[str] | None = None) -> int:
                     note = "searching: rotating in place"
                 
                 print(
-                    f"[{step + 1}/{args.steps}] {note} "
+                    f"[{step + 1}/{total}] {note} "
                     f"left={left:+.2f} right={right:+.2f}"
                 )
 
