@@ -1,0 +1,22 @@
+# Raspberry Pi runtime — inference only, no PyTorch, no ultralytics.
+#
+# Install the ARM-optimised system packages from apt FIRST, then create the venv
+# with --system-site-packages so it can see them:
+#
+#   sudo apt update
+#   sudo apt install -y python3-opencv python3-picamera2 python3-gpiozero python3-numpy
+#   python3 -m venv --system-site-packages ~/leafvenv
+#   source ~/leafvenv/bin/activate
+#   pip install -r requirements-pi.txt
+#
+# Why apt for the rest: python3-opencv and python3-picamera2 are built against
+# the system numpy and the libcamera ABI on this board. Installing the pip
+# wheels instead is slower, much larger, and a common source of
+# "numpy.core.multiarray failed to import" breakage.
+#
+# onnxruntime accepts numpy>=1.21.6, so the apt numpy already satisfies it and
+# pip leaves it untouched. numpy is listed here only as a floor for the case
+# where it is missing entirely.
+
+onnxruntime>=1.20,<2
+numpy>=1.24

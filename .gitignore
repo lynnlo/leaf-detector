@@ -6,11 +6,12 @@ __pycache__/
 .venv/
 venv/
 
-# Local test harness for capture.py; not part of the robot runtime
-test_capture.py
+# Local test harness; not part of the robot runtime
+test_*.py
 
 # Model weights and exported artefacts
 models/
+dataset/
 *.pt
 *.onnx
 *.tflite

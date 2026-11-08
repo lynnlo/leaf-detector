@@ -5,6 +5,10 @@ converts the box's horizontal offset into differential motor speeds, holds that
 command briefly, stops, and repeats. Motor output goes through the L298N class in
 drive.py, so the pinout lives in one place.
 
+Inference runs through ONNX Runtime (leaf_detector.py), so the Pi needs neither
+ultralytics nor PyTorch. The ONNX model is produced on a desktop machine with
+export_for_pi.py and copied across.
+
 Motors only move when --drive is passed. Without it the script prints the command
 it would send and leaves the wheels still.
 """
@@ -12,7 +16,6 @@ it would send and leaves the wheels still.
 from __future__ import annotations
 
 import argparse
-import os
 import subprocess
 import sys
 import time
@@ -24,43 +27,10 @@ import cv2
 import numpy as np
 
 from drive import L298N
+from leaf_detector import DEFAULT_CLASSES, Detection, OnnxLeafDetector
 
-
-# Class names requested from a zero-shot model when no trained model is supplied.
-DEFAULT_CLASSES = ("leaf", "fallen leaf", "pile of leaves")
-ZERO_SHOT_MODEL = "yolov8s-worldv2.pt"
-
-
-@dataclass(frozen=True)
-class Detection:
-    """One detected leaf, in pixel coordinates."""
-
-    x1: float
-    y1: float
-    x2: float
-    y2: float
-    confidence: float
-    label: str
-
-    @property
-    def width(self) -> float:
-        return max(0.0, self.x2 - self.x1)
-
-    @property
-    def height(self) -> float:
-        return max(0.0, self.y2 - self.y1)
-
-    @property
-    def area(self) -> float:
-        return self.width * self.height
-
-    @property
-    def center_x(self) -> float:
-        return (self.x1 + self.x2) / 2.0
-
-    @property
-    def center_y(self) -> float:
-        return (self.y1 + self.y2) / 2.0
+HERE = Path(__file__).resolve().parent
+DEFAULT_MODEL = HERE / "models" / "leaf.onnx"
 
 
 @dataclass(frozen=True)
@@ -131,52 +101,6 @@ class Camera:
             self._picam.stop()
             self._picam.close()
             self._picam = None
-
-
-class LeafDetector:
-    """Wraps an Ultralytics model and returns Detection objects."""
-
-    def __init__(
-        self,
-        model_path: str,
-        confidence: float,
-        imgsz: int,
-        classes: tuple[str, ...] = DEFAULT_CLASSES,
-    ) -> None:
-        from ultralytics import YOLO
-
-        self.model = YOLO(model_path)
-        self.confidence = confidence
-        self.imgsz = imgsz
-
-        # Zero-shot models need their vocabulary set before inference.
-        if "world" in Path(model_path).stem.lower():
-            self.model.set_classes(list(classes))
-
-    def detect(self, frame: np.ndarray) -> list[Detection]:
-        result = self.model.predict(
-            frame, imgsz=self.imgsz, conf=self.confidence, verbose=False
-        )[0]
-        boxes = result.boxes
-        if boxes is None:
-            return []
-
-        names = result.names
-        detections: list[Detection] = []
-        for xyxy, conf, cls in zip(
-            boxes.xyxy.tolist(), boxes.conf.tolist(), boxes.cls.tolist()
-        ):
-            detections.append(
-                Detection(
-                    x1=float(xyxy[0]),
-                    y1=float(xyxy[1]),
-                    x2=float(xyxy[2]),
-                    y2=float(xyxy[3]),
-                    confidence=float(conf),
-                    label=str(names[int(cls)]),
-                )
-            )
-        return detections
 
 
 def choose_target(detections: list[Detection]) -> Detection | None:
@@ -285,32 +209,33 @@ def annotate(
     return canvas
 
 
-def resolve_model(explicit: str | None) -> str:
-    """Pick the model path: an explicit one, a local trained one, else zero-shot."""
-    if explicit:
-        return explicit
-    local = Path(__file__).with_name("models") / "leaf.pt"
-    if local.exists():
-        return str(local)
-    print(
-        f"No trained model found at {local}; falling back to zero-shot "
-        f"{ZERO_SHOT_MODEL}. Accuracy will be poor until a model is trained and "
-        "placed there, or passed with --model.",
-        file=sys.stderr,
-    )
-    return ZERO_SHOT_MODEL
-
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Detect leaves from the Pi camera and steer toward them."
     )
-    parser.add_argument("--model", help="path to a trained YOLO weights file")
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=DEFAULT_MODEL,
+        help=f"ONNX weights (default: {DEFAULT_MODEL.relative_to(HERE)})",
+    )
+    parser.add_argument(
+        "--classes",
+        nargs="+",
+        default=list(DEFAULT_CLASSES),
+        help="class names in the model's output order",
+    )
     parser.add_argument(
         "--conf", type=float, default=0.35, help="detection confidence (default: 0.35)"
     )
     parser.add_argument(
-        "--imgsz", type=int, default=320, help="inference size (default: 320)"
+        "--iou", type=float, default=0.45, help="NMS IoU threshold (default: 0.45)"
+    )
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=320,
+        help="must match the size the model was exported at (default: 320)",
     )
     parser.add_argument(
         "--width", type=int, default=640, help="capture width (default: 640)"
@@ -356,9 +281,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="rotate in place when no leaf is visible instead of stopping",
     )
-    parser.add_argument(
-        "--preview", action="store_true", help="show an annotated window"
-    )
+    parser.add_argument("--preview", action="store_true", help="show an annotated window")
     parser.add_argument("--save", metavar="PATH", help="write the annotated last frame")
     args = parser.parse_args(argv)
 
@@ -369,35 +292,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    speed_cap = args.speed / 100.0
+
+    if not args.model.is_file():
+        print(f"ONNX model not found: {args.model}", file=sys.stderr)
+        print(
+            "Export it on a desktop machine with:\n"
+            "  python export_for_pi.py models/leaf.pt --formats onnx --imgsz 320\n"
+            "then copy the .onnx file into models/.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        detector = OnnxLeafDetector(
+            args.model,
+            class_names=tuple(args.classes),
+            confidence=args.conf,
+            iou=args.iou,
+            imgsz=args.imgsz,
+        )
+    except ImportError:
+        print("onnxruntime is not installed. Run: pip install onnxruntime", file=sys.stderr)
+        return 1
+
     params = DriveParams(
         k_angle=args.k_angle,
         k_linear=args.k_linear,
-        v_max=speed_cap,
+        v_max=args.speed / 100.0,
         stop_height_ratio=args.stop_height,
     )
 
-    model_path = resolve_model(args.model)
-    if not os.path.exists(model_path) and model_path != ZERO_SHOT_MODEL:
-        print(f"Model not found: {model_path}", file=sys.stderr)
-        return 1
-
     camera = Camera(args.width, args.height)
-    print(f"camera backend: {camera.backend}")
-
-    try:
-        detector = LeafDetector(model_path, args.conf, args.imgsz)
-    except ImportError:
-        camera.close()
-        print("ultralytics is not installed. Run: pip install ultralytics", file=sys.stderr)
-        return 1
+    print(f"camera backend: {camera.backend}   model: {args.model.name}")
 
     with ExitStack() as stack:
         driver = L298N(stack) if args.drive else None
         if driver is None:
             print("dry run: motors are not energised (pass --drive to move)")
 
-        search_speed = speed_cap * 0.4
+        search_speed = params.v_max * 0.4
         last_frame: np.ndarray | None = None
 
         try:

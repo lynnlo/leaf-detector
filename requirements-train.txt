@@ -1,0 +1,20 @@
+# Training and ONNX export — Linux x86_64 with an NVIDIA GPU.
+#
+# Do NOT install this on the Raspberry Pi. torch alone is several gigabytes and
+# is exactly what fills a Pi SD card; see requirements-pi.txt for the device.
+#
+# Requires Python 3.11 or newer (torch 2.15 does not publish 3.10 wheels).
+#
+#   python3 -m venv ~/leaf-train && source ~/leaf-train/bin/activate
+#   pip install -r requirements-train.txt
+#
+# For a specific CUDA build, install torch first from the PyTorch wheel index,
+# then install this file without replacing it:
+#   pip install torch==2.15.0 torchvision==0.29.2 \
+#     --index-url https://download.pytorch.org/whl/cu128
+#   pip install -r requirements-train.txt
+
+ultralytics[export]==8.4.207
+torch==2.15.0
+torchvision==0.29.2
+numpy>=1.26,<2.6
